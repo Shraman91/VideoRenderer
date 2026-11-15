@@ -81,6 +81,8 @@ struct DemoOptions {
 bool parse_video_args(int argc, char** argv, ascii::VideoOptions& opts) {
     if (argc < 3) return false;
     opts.path = argv[2];
+    bool mode_set = false;
+    bool charset_set = false;
 
     for (int i = 3; i < argc; ++i) {
         std::string arg = argv[i];
@@ -91,14 +93,18 @@ bool parse_video_args(int argc, char** argv, ascii::VideoOptions& opts) {
         } else if (arg == "--blocks") {
             opts.color = true;
             opts.mode = ascii::RenderMode::Blocks;
+            mode_set = true;
         } else if (arg == "--mode" && i + 1 < argc) {
             std::string mode_str = argv[++i];
+            mode_set = true;
             if (mode_str == "blocks") {
                 opts.mode = ascii::RenderMode::Blocks;
+                opts.color = true;
             } else if (mode_str == "ascii") {
                 opts.mode = ascii::RenderMode::Ascii;
             } else if (mode_str == "solid") {
                 opts.mode = ascii::RenderMode::Solid;
+                opts.color = true;
             }
         } else if (arg == "--fps" && i + 1 < argc) {
             opts.fps = std::atoi(argv[++i]);
@@ -118,9 +124,17 @@ bool parse_video_args(int argc, char** argv, ascii::VideoOptions& opts) {
             opts.audio_delay = std::atoi(argv[++i]);
         } else if (arg == "--charset" && i + 1 < argc) {
             opts.charset = argv[++i];
+            charset_set = true;
         } else if (arg == "--invert") {
             opts.invert = true;
         }
+    }
+
+    if (charset_set && !mode_set) {
+        opts.mode = ascii::RenderMode::Ascii;
+    }
+    if (opts.mode == ascii::RenderMode::Blocks || opts.mode == ascii::RenderMode::Solid) {
+        opts.color = true;
     }
     return true;
 }
@@ -279,6 +293,8 @@ int cmd_video(int argc, char** argv) {
 }
 
 int main(int argc, char** argv) {
+    ascii::Terminal::initialize();
+
     if (argc < 2) {
         print_usage();
         return 1;

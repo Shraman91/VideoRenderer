@@ -1,12 +1,23 @@
 #pragma once
 
 #include <string>
+#include <cstddef>
 
 namespace ascii {
 
 // Terminal utilities
 class Terminal {
 public:
+    // Initialize Windows Console / Terminal (VT processing, UTF-8 CP, timer precision)
+    static void initialize();
+    static void restore();
+
+    // Maximize console window on Windows
+    static void maximize_window();
+
+    // Fast atomic write to terminal
+    static void write_raw(const char* data, size_t size);
+
     // Get terminal dimensions
     static bool get_size(int& width, int& height);
 

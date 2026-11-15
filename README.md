@@ -1,114 +1,165 @@
-# ASCII Art Renderer
+# RGB Video & ASCII Art Renderer
 
-A C++ command-line tool that renders images, videos, and procedural 3D demos as ASCII art in your terminal.
+A high-performance C++ command-line tool that renders videos, images, and procedural 3D demos with photorealistic 24-bit TrueColor in **Windows Terminal**, **PowerShell**, and **Command Prompt** (as well as MSYS2 / Linux).
+
+---
 
 ## Features
 
-- **Image rendering** - Convert PNG/JPG images to ASCII art
-- **Video playback** - Stream videos as real-time ASCII animation with optional color
-- **Procedural demos** - Watch rotating 3D objects (cube, donut) rendered in ASCII
-- Multiple character sets (classic, detailed, letters)
-- Color support via ANSI 24-bit escape codes
-- Aspect-ratio correction for terminal cells
+- **Photorealistic Half-Block RGB Video (`--mode blocks`)** - Uses unicode upper half-blocks (`▀`) with 24-bit foreground and background colors to deliver **double vertical resolution** and square pixels.
+- **Native Windows Terminal / PowerShell / CMD Support** - Fully configures Windows Virtual Terminal Processing (`ENABLE_VIRTUAL_TERMINAL_PROCESSING`), UTF-8 code page, and high-precision timers.
+- **Ultra-Smooth, Tearing-Free Playback** -
+  - Windows 1ms multimedia timer (`timeBeginPeriod`).
+  - PTS presentation timestamp tracking for exact audio/video synchronization without drift.
+  - Sub-millisecond hybrid sleep (coarse sleep + fine spin-wait yield).
+  - Atomic direct-to-console writes (`WriteFile`) with DEC synchronized update markers (`\033[?2026h`).
+  - State-cached ANSI escape sequence generator that skips redundant color codes.
+- **True Fullscreen Mode (`--fullscreen` or `-f`)** -
+  - Automatically maximizes the Windows console window.
+  - Dynamically fills the full terminal width and height while preserving the video's aspect ratio with centered letterboxing/pillarboxing.
+  - Dynamically adapts if you resize the terminal or press `F11` in Windows Terminal.
+- **Multiple Render Modes**:
+  - `blocks` - Half-block 24-bit TrueColor (highest resolution & photorealistic, default).
+  - `ascii` - Classic or colored ASCII character glyphs with luminance ramps.
+  - `solid` - Full-block (`█`) 24-bit color cells.
+- **Synchronized Audio Playback** - Seamless background audio powered by `ffplay` with automatic binary discovery.
+- **Interactive Controls** - Pause, toggle fullscreen, cycle render modes, and cleanly quit on the fly.
 
-## Requirements (MSYS2/MinGW on Windows)
+---
 
-This project is built for MSYS2 with the MinGW-w64 toolchain. Install dependencies:
+## Running in Windows Terminal, PowerShell, or CMD
 
+You do **not** need to open an MSYS2/MinGW terminal! You can run directly in **Windows Terminal**, **PowerShell**, or **CMD**:
+
+### Option 1: Use the included launchers (Instant, zero configuration)
+
+From PowerShell:
+```powershell
+.\ascii-art.ps1 video dance.mp4 --fullscreen
+```
+
+From Command Prompt or PowerShell:
+```cmd
+ascii-art video dance.mp4 --fullscreen
+# or
+.\ascii-art.bat video dance.mp4 --fullscreen
+```
+
+### Option 2: Add MinGW64 to your User PATH (Run `ascii-art.exe` anywhere)
+
+To run `build\ascii-art.exe` directly from any terminal window without batch wrappers, add `C:\msys64\mingw64\bin` to your Windows User PATH:
+
+In PowerShell:
+```powershell
+[Environment]::SetEnvironmentVariable("PATH", [Environment]::GetEnvironmentVariable("PATH", "User") + ";C:\msys64\mingw64\bin", "User")
+```
+After restarting your terminal, you can run:
+```powershell
+.\build\ascii-art.exe video dance.mp4 --fullscreen
+```
+
+---
+
+## Usage
+
+### 1. Video Playback
+
+```powershell
+# Fullscreen high-definition RGB half-block playback (default, smoothest quality)
+.\ascii-art.ps1 video dance.mp4 --fullscreen
+
+# Video in a standard window with custom width
+.\ascii-art.ps1 video dragon.mp4 --width 140
+
+# Colored ASCII character mode
+.\ascii-art.ps1 video dance.mp4 --mode ascii --color --fullscreen
+
+# Classic monochrome ASCII mode
+.\ascii-art.ps1 video dance.mp4 --mode ascii --charset detailed
+
+# Full block mode
+.\ascii-art.ps1 video dance.mp4 --mode solid --fullscreen
+```
+
+#### Video Options:
+- `--fullscreen`, `-f` - Maximize the console window and scale to full terminal size
+- `--mode blocks|ascii|solid` - Render mode (default: `blocks`)
+- `--blocks` - Shortcut for `--mode blocks --color`
+- `--color` - Enable 24-bit RGB truecolor output
+- `--fps N` - Target framerate (default: source video FPS)
+- `--width N` - Output width in character columns
+- `--height N` - Output height in rows
+- `--smoothing N` - Temporal frame blending [0.0 - 0.95]
+- `--quant N` - Color quantization step (e.g. 8, 16)
+- `--max-frame-skip N` - Maximum consecutive frames to drop when falling behind (default: 5)
+- `--no-audio` - Disable audio playback
+- `--audio-delay N` - Audio sync offset in milliseconds (+/- ms)
+- `--charset classic|detailed|letters` - Character ramp for ascii mode
+- `--invert` - Invert brightness mapping
+
+#### Interactive Keyboard Controls (During Playback):
+- `Space` - **Pause / Resume** playback
+- `f` - **Maximize window / Fullscreen**
+- `m` - **Cycle render modes** (`blocks` ➔ `ascii` ➔ `solid`)
+- `q` or `Esc` - **Exit cleanly** and restore terminal settings
+- `F11` (in Windows Terminal) - Enter true borderless fullscreen
+
+---
+
+### 2. Image Rendering
+
+```powershell
+.\ascii-art.ps1 image test.jpg --width 100
+.\ascii-art.ps1 image photo.png --charset detailed -o output.txt
+```
+
+---
+
+### 3. Procedural 3D Demos
+
+```powershell
+# List demos
+.\ascii-art.ps1 list
+
+# Run rotating 3D wireframe cube
+.\ascii-art.ps1 demo cube
+
+# Run spinning torus (donut)
+.\ascii-art.ps1 demo donut --charset detailed
+```
+
+---
+
+## Building from Source
+
+Dependencies (installed once via MSYS2):
 ```bash
-# Update MSYS2 package database
-pacman -Syu
-
-# Install build tools
 pacman -S mingw-w64-x86_64-gcc \
           mingw-w64-x86_64-cmake \
           mingw-w64-x86_64-ninja \
           mingw-w64-x86_64-ffmpeg \
-          make
+          mingw-w64-x86_64-pkg-config
 ```
 
-## Build
-
-```bash
-mkdir build
-cd build
-cmake -G "MSYS Makefiles" ..
-make -j$(nproc)
-```
-
-Or with Ninja (faster):
-
-```bash
-mkdir build
+Build with Ninja:
+```powershell
+$env:PATH = "C:\msys64\mingw64\bin;" + $env:PATH
 cd build
 cmake -G Ninja ..
 ninja
 ```
 
-## Usage
-
-### List available demos
-```bash
-./ascii-art list
-```
-
-### Render an image
-```bash
-./ascii-art image path/to/image.png
-./ascii-art image photo.jpg --width 80 --charset detailed
-./ascii-art image logo.png --invert -o output.txt
-```
-
-Options:
-- `--width N` - Set output width in characters (default: terminal width)
-- `--height N` - Set output height in characters (default: auto from aspect ratio)
-- `--charset classic|detailed|letters` - Character ramp to use
-- `--invert` - Invert brightness mapping
-- `-o, --output PATH` - Write to file instead of stdout
-
-### Render a video
-```bash
-./ascii-art video movie.mp4
-./ascii-art video clip.avi --color --fps 30 --width 120
-./ascii-art video video.mkv --no-audio --invert
-```
-
-Options:
-- `--color` - Enable 24-bit color output
-- `--fps N` - Target playback framerate (default: source fps)
-- `--width N` - Output width in characters
-- `--smoothing N` - Temporal smoothing factor (0-1, default: 0)
-- `--quant N` - Color quantization level for --color mode
-- `--max-frame-skip N` - Maximum consecutive frames to drop when behind (default: 5)
-- `--no-audio` - Disable audio playback
-- `--audio-delay N` - Audio sync offset in milliseconds
-- `--charset classic|detailed|letters` - Character ramp
-- `--invert` - Invert brightness
-
-### Run a procedural demo
-```bash
-./ascii-art demo cube
-./ascii-art demo donut --width 80 --charset detailed
-```
-
-Press Ctrl+C to exit.
+---
 
 ## Architecture
 
-- `src/main.cpp` - CLI entry point and subcommand dispatch
-- `src/image_renderer.cpp` - Image decoding and ASCII conversion
-- `src/video_renderer.cpp` - FFmpeg integration and video playback
-- `src/terminal.cpp` - Terminal size detection, ANSI codes, signal handling
-- `src/demos/` - Procedural demo implementations (cube, donut, etc.)
-- `third_party/` - Vendored single-header libraries (stb_image.h)
+- `src/terminal.cpp` - Console mode configuration (`ENABLE_VIRTUAL_TERMINAL_PROCESSING`), UTF-8 code page setup, 1ms timer precision, atomic console write (`WriteFile`), and window maximization.
+- `src/video_renderer.cpp` - FFmpeg decoding, bilinear scaling, PTS presentation timing, half-block 24-bit truecolor rasterizer, state-cached ANSI escape generator, and `ffplay` audio synchronization.
+- `src/main.cpp` - Command-line interface and subcommand dispatch.
+- `src/image_renderer.cpp` - Image loading and ASCII conversion.
+- `src/demos/` - Procedural 3D math demos (cube, donut, sphere, planet).
 
-## Adding New Demos
-
-1. Create a new file in `src/demos/your_demo.cpp`
-2. Implement the `DemoRenderer` interface
-3. Register it in `src/demos/demo_registry.cpp`
-
-Each demo receives frame index, dimensions, and character ramp, and returns a rendered frame string.
+---
 
 ## License
 

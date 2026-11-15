@@ -14,43 +14,210 @@ extern "C" {
 #include <vector>
 #include <thread>
 #include <chrono>
+#include <atomic>
+#include <mutex>
 #include <cmath>
 #include <algorithm>
-#include <sstream>
+#include <string>
 #include <cstdio>
+#include <cstdlib>
+#include <cstring>
 
 #ifdef _WIN32
     #include <windows.h>
     #include <io.h>
+    #include <conio.h>
 #else
     #include <unistd.h>
     #include <sys/wait.h>
+    #include <signal.h>
 #endif
 
 namespace ascii {
 
-// Audio subprocess
+// Fast integer to string formatting (0-255) without heap allocation
+inline void append_uint8(std::string& s, uint8_t v) {
+    if (v >= 100) {
+        s.push_back(static_cast<char>('0' + (v / 100)));
+        v %= 100;
+        s.push_back(static_cast<char>('0' + (v / 10)));
+        s.push_back(static_cast<char>('0' + (v % 10)));
+    } else if (v >= 10) {
+        s.push_back(static_cast<char>('0' + (v / 10)));
+        s.push_back(static_cast<char>('0' + (v % 10)));
+    } else {
+        s.push_back(static_cast<char>('0' + v));
+    }
+}
+
+inline void append_int(std::string& s, int val) {
+    if (val >= 1000) {
+        s.append(std::to_string(val));
+    } else if (val >= 100) {
+        s.push_back(static_cast<char>('0' + (val / 100)));
+        val %= 100;
+        s.push_back(static_cast<char>('0' + (val / 10)));
+        s.push_back(static_cast<char>('0' + (val % 10)));
+    } else if (val >= 10) {
+        s.push_back(static_cast<char>('0' + (val / 10)));
+        s.push_back(static_cast<char>('0' + (val % 10)));
+    } else if (val >= 0) {
+        s.push_back(static_cast<char>('0' + val));
+    }
+}
+
+inline void append_cursor_pos(std::string& s, int row, int col) {
+    s.append("\033[");
+    append_int(s, row);
+    s.push_back(';');
+    append_int(s, col);
+    s.push_back('H');
+}
+
+inline void append_fg(std::string& s, uint8_t r, uint8_t g, uint8_t b) {
+    s.append("\033[38;2;");
+    append_uint8(s, r);
+    s.push_back(';');
+    append_uint8(s, g);
+    s.push_back(';');
+    append_uint8(s, b);
+    s.push_back('m');
+}
+
+inline void append_bg(std::string& s, uint8_t r, uint8_t g, uint8_t b) {
+    s.append("\033[48;2;");
+    append_uint8(s, r);
+    s.push_back(';');
+    append_uint8(s, g);
+    s.push_back(';');
+    append_uint8(s, b);
+    s.push_back('m');
+}
+
+#ifdef _WIN32
+static std::string find_ffplay() {
+    // 1. Check directory of current executable
+    char exe_path[MAX_PATH];
+    if (GetModuleFileNameA(nullptr, exe_path, MAX_PATH)) {
+        std::string dir(exe_path);
+        size_t last_slash = dir.find_last_of("\\/");
+        if (last_slash != std::string::npos) {
+            std::string candidate = dir.substr(0, last_slash + 1) + "ffplay.exe";
+            DWORD attr = GetFileAttributesA(candidate.c_str());
+            if (attr != INVALID_FILE_ATTRIBUTES && !(attr & FILE_ATTRIBUTE_DIRECTORY)) {
+                return candidate;
+            }
+        }
+    }
+    // 2. Check MSYS2 / MinGW installation default
+    DWORD attr = GetFileAttributesA("C:\\msys64\\mingw64\\bin\\ffplay.exe");
+    if (attr != INVALID_FILE_ATTRIBUTES && !(attr & FILE_ATTRIBUTE_DIRECTORY)) {
+        return "C:\\msys64\\mingw64\\bin\\ffplay.exe";
+    }
+    // 3. Fallback to PATH
+    return "ffplay";
+}
+#endif
+
+#ifdef _WIN32
+typedef LONG (NTAPI *pfnNtSuspendProcess)(HANDLE);
+typedef LONG (NTAPI *pfnNtResumeProcess)(HANDLE);
+static pfnNtSuspendProcess g_pNtSuspendProcess = nullptr;
+static pfnNtResumeProcess g_pNtResumeProcess = nullptr;
+
+static void init_nt_audio_funcs() {
+    static bool initialized = false;
+    if (initialized) return;
+    HMODULE ntdll = GetModuleHandleA("ntdll.dll");
+    if (ntdll) {
+        FARPROC pSuspend = GetProcAddress(ntdll, "NtSuspendProcess");
+        FARPROC pResume = GetProcAddress(ntdll, "NtResumeProcess");
+        std::memcpy(&g_pNtSuspendProcess, &pSuspend, sizeof(pSuspend));
+        std::memcpy(&g_pNtResumeProcess, &pResume, sizeof(pResume));
+    }
+    initialized = true;
+}
+
+static HANDLE get_audio_job_object() {
+    static HANDLE hJob = nullptr;
+    if (!hJob) {
+        hJob = CreateJobObjectA(nullptr, nullptr);
+        if (hJob) {
+            JOBOBJECT_EXTENDED_LIMIT_INFORMATION jeli = {};
+            jeli.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+            SetInformationJobObject(hJob, JobObjectExtendedLimitInformation, &jeli, sizeof(jeli));
+        }
+    }
+    return hJob;
+}
+#endif
+
+class AudioPlayer;
+static std::atomic<AudioPlayer*> g_active_audio_player{nullptr};
+
+static void stop_global_audio();
+
+#ifdef _WIN32
+static BOOL WINAPI audio_console_ctrl_handler(DWORD ctrl_type) {
+    if (ctrl_type == CTRL_C_EVENT || ctrl_type == CTRL_BREAK_EVENT || ctrl_type == CTRL_CLOSE_EVENT) {
+        stop_global_audio();
+        Terminal::restore();
+        ExitProcess(0);
+    }
+    return FALSE;
+}
+#endif
+
+// Audio subprocess player with bulletproof process lifecycle
 class AudioPlayer {
 public:
     AudioPlayer(const std::string& path, int delay_ms, bool no_audio)
-        : path_(path), delay_ms_(delay_ms), no_audio_(no_audio) {
+        : path_(path), delay_ms_(delay_ms), no_audio_(no_audio),
+          stop_requested_(false), is_paused_(false) {
 #ifdef _WIN32
         process_handle_ = nullptr;
+        init_nt_audio_funcs();
+        static bool handler_set = false;
+        if (!handler_set) {
+            SetConsoleCtrlHandler(audio_console_ctrl_handler, TRUE);
+            handler_set = true;
+        }
 #else
         pid_ = -1;
 #endif
+        g_active_audio_player.store(this);
+        static bool atexit_set = false;
+        if (!atexit_set) {
+            std::atexit(stop_global_audio);
+            atexit_set = true;
+        }
     }
 
-    ~AudioPlayer() { stop(); }
+    ~AudioPlayer() {
+        stop();
+        AudioPlayer* expected = this;
+        g_active_audio_player.compare_exchange_strong(expected, nullptr);
+    }
 
     void start() {
-        if (no_audio_) return;
+        if (no_audio_ || stop_requested_) return;
+
         if (delay_ms_ > 0) {
-            std::this_thread::sleep_for(std::chrono::milliseconds(delay_ms_));
+            auto end_time = std::chrono::steady_clock::now() + std::chrono::milliseconds(delay_ms_);
+            while (std::chrono::steady_clock::now() < end_time) {
+                if (stop_requested_) return;
+                std::this_thread::sleep_for(std::chrono::milliseconds(10));
+            }
         }
 
+        if (stop_requested_) return;
+
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (stop_requested_) return;
+
 #ifdef _WIN32
-        std::string cmd = "ffplay -nodisp -autoexit -loglevel quiet";
+        std::string ffplay_bin = find_ffplay();
+        std::string cmd = "\"" + ffplay_bin + "\" -nodisp -autoexit -loglevel quiet";
         if (delay_ms_ < 0) {
             cmd += " -ss " + std::to_string(std::abs(delay_ms_) / 1000.0f);
         }
@@ -66,6 +233,12 @@ public:
                           FALSE, CREATE_NO_WINDOW, nullptr, nullptr, &si, &pi)) {
             process_handle_ = pi.hProcess;
             CloseHandle(pi.hThread);
+
+            // Assign to job object: Windows kernel will kill child immediately if parent exits or crashes
+            HANDLE hJob = get_audio_job_object();
+            if (hJob) {
+                AssignProcessToJobObject(hJob, pi.hProcess);
+            }
         }
 #else
         pid_t pid = fork();
@@ -79,15 +252,60 @@ public:
 #endif
     }
 
+    void pause() {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (is_paused_) return;
+
+#ifdef _WIN32
+        if (process_handle_ && g_pNtSuspendProcess) {
+            g_pNtSuspendProcess(process_handle_);
+        }
+#else
+        if (pid_ > 0) {
+            kill(pid_, SIGSTOP);
+        }
+#endif
+        is_paused_ = true;
+    }
+
+    void resume() {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (!is_paused_) return;
+
+#ifdef _WIN32
+        if (process_handle_ && g_pNtResumeProcess) {
+            g_pNtResumeProcess(process_handle_);
+        }
+#else
+        if (pid_ > 0) {
+            kill(pid_, SIGCONT);
+        }
+#endif
+        is_paused_ = false;
+    }
+
     void stop() {
+        stop_requested_ = true;
+        std::lock_guard<std::mutex> lock(mutex_);
+
 #ifdef _WIN32
         if (process_handle_) {
+            if (is_paused_ && g_pNtResumeProcess) {
+                // Resume before terminating to avoid deadlocks
+                g_pNtResumeProcess(process_handle_);
+                is_paused_ = false;
+            }
             TerminateProcess(process_handle_, 0);
+            WaitForSingleObject(process_handle_, 300);
             CloseHandle(process_handle_);
             process_handle_ = nullptr;
         }
 #else
         if (pid_ > 0) {
+            if (is_paused_) {
+                kill(pid_, SIGCONT);
+                is_paused_ = false;
+            }
             kill(pid_, SIGTERM);
             waitpid(pid_, nullptr, 0);
             pid_ = -1;
@@ -99,6 +317,9 @@ private:
     std::string path_;
     int delay_ms_;
     bool no_audio_;
+    std::atomic<bool> stop_requested_;
+    bool is_paused_;
+    std::mutex mutex_;
 #ifdef _WIN32
     HANDLE process_handle_;
 #else
@@ -106,43 +327,141 @@ private:
 #endif
 };
 
+static void stop_global_audio() {
+    AudioPlayer* p = g_active_audio_player.exchange(nullptr);
+    if (p) {
+        p->stop();
+    }
+}
+
+static void calculate_dimensions(RenderMode mode, const VideoOptions& opts,
+                                double aspect,
+                                int term_w, int term_h,
+                                int& render_w, int& render_h,
+                                int& pad_x, int& pad_y) {
+    int avail_w = std::max(10, term_w);
+    int avail_h = std::max(4, term_h - 2); // Reserve 2 lines so cursor never triggers terminal scroll
+
+    if (mode == RenderMode::Blocks) {
+        // Half-block mode: 2 vertical pixels per terminal cell row
+        int avail_h_px = avail_h * 2;
+
+        if (opts.width > 0 && opts.height > 0) {
+            render_w = opts.width;
+            render_h = opts.height * 2;
+        } else if (opts.width > 0) {
+            render_w = opts.width;
+            render_h = static_cast<int>(render_w / aspect);
+        } else if (opts.fullscreen) {
+            // Fullscreen: fill the maximum screen area while preserving aspect ratio
+            render_w = avail_w;
+            render_h = static_cast<int>(render_w / aspect);
+            if (render_h > avail_h_px) {
+                render_h = avail_h_px;
+                render_w = static_cast<int>(render_h * aspect);
+            }
+        } else {
+            // Default windowed: fit inside terminal width, capped comfortably
+            int max_w = std::min(avail_w, 140);
+            render_w = max_w;
+            render_h = static_cast<int>(render_w / aspect);
+            if (render_h > avail_h_px) {
+                render_h = avail_h_px;
+                render_w = static_cast<int>(render_h * aspect);
+            }
+        }
+
+        // Half-blocks require an even vertical pixel count
+        if (render_h % 2 != 0) render_h--;
+        render_w = std::max(2, std::min(render_w, avail_w));
+        render_h = std::max(2, std::min(render_h, avail_h_px));
+
+        int cell_rows = render_h / 2;
+        pad_x = std::max(0, (term_w - render_w) / 2);
+        pad_y = std::max(0, (term_h - cell_rows) / 2);
+    } else {
+        // Ascii or Solid mode: 1 pixel per terminal cell (aspect ratio correction ~0.5)
+        if (opts.width > 0 && opts.height > 0) {
+            render_w = opts.width;
+            render_h = opts.height;
+        } else if (opts.width > 0) {
+            render_w = opts.width;
+            render_h = static_cast<int>(render_w / aspect * 0.5);
+        } else if (opts.fullscreen) {
+            render_w = avail_w;
+            render_h = static_cast<int>(render_w / aspect * 0.5);
+            if (render_h > avail_h) {
+                render_h = avail_h;
+                render_w = static_cast<int>(render_h * aspect * 2.0);
+            }
+        } else {
+            int max_w = std::min(avail_w, 120);
+            render_w = max_w;
+            render_h = static_cast<int>(render_w / aspect * 0.5);
+            if (render_h > avail_h) {
+                render_h = avail_h;
+                render_w = static_cast<int>(render_h * aspect * 2.0);
+            }
+        }
+
+        render_w = std::max(2, std::min(render_w, avail_w));
+        render_h = std::max(2, std::min(render_h, avail_h));
+
+        pad_x = std::max(0, (term_w - render_w) / 2);
+        pad_y = std::max(0, (term_h - render_h) / 2);
+    }
+}
+
 int VideoRenderer::play(const VideoOptions& opts) {
+    // 1. Initialize terminal environment for Windows Terminal / Console
+    Terminal::initialize();
+
+    if (opts.fullscreen) {
+        Terminal::maximize_window();
+    }
+
     AVFormatContext* format_ctx = nullptr;
     AVCodecContext* codec_ctx = nullptr;
     SwsContext* sws_ctx = nullptr;
     AVFrame* frame = nullptr;
     AVFrame* rgb_frame = nullptr;
     AVPacket* packet = nullptr;
-    uint8_t* rgb_buffer = nullptr;
+    uint8_t* prev_rgb_buffer = nullptr;
 
     int video_stream_idx = -1;
     int ret = 0;
 
-    // Suppress FFmpeg error messages that pollute terminal output
     av_log_set_level(AV_LOG_QUIET);
 
-    ret = avformat_open_input(&format_ctx, opts.path.c_str(), nullptr, nullptr);
+    std::string video_path = opts.path;
+    ret = avformat_open_input(&format_ctx, video_path.c_str(), nullptr, nullptr);
     if (ret < 0) {
-        std::cerr << "Error: Could not open '" << opts.path << "'\n";
-        return 1;
+        std::string fallback_path = "../" + opts.path;
+        if (avformat_open_input(&format_ctx, fallback_path.c_str(), nullptr, nullptr) >= 0) {
+            video_path = fallback_path;
+            ret = 0;
+        } else {
+            std::cerr << "Error: Could not open '" << opts.path << "'\n";
+            return 1;
+        }
     }
 
     ret = avformat_find_stream_info(format_ctx, nullptr);
     if (ret < 0) {
-        std::cerr << "Error: Could not find stream info\n";
+        std::cerr << "Error: Could not find stream info in '" << video_path << "'\n";
         avformat_close_input(&format_ctx);
         return 1;
     }
 
     for (unsigned i = 0; i < format_ctx->nb_streams; i++) {
         if (format_ctx->streams[i]->codecpar->codec_type == AVMEDIA_TYPE_VIDEO) {
-            video_stream_idx = i;
+            video_stream_idx = static_cast<int>(i);
             break;
         }
     }
 
     if (video_stream_idx == -1) {
-        std::cerr << "Error: No video stream\n";
+        std::cerr << "Error: No video stream found in '" << opts.path << "'\n";
         avformat_close_input(&format_ctx);
         return 1;
     }
@@ -152,7 +471,7 @@ int VideoRenderer::play(const VideoOptions& opts) {
 
     const AVCodec* codec = avcodec_find_decoder(codec_params->codec_id);
     if (!codec) {
-        std::cerr << "Error: Codec not supported\n";
+        std::cerr << "Error: Video codec not supported\n";
         avformat_close_input(&format_ctx);
         return 1;
     }
@@ -165,9 +484,7 @@ int VideoRenderer::play(const VideoOptions& opts) {
     }
 
     avcodec_parameters_to_context(codec_ctx, codec_params);
-
-    // Multi-threaded decoding
-    codec_ctx->thread_count = 0;
+    codec_ctx->thread_count = 0; // Auto multi-threaded decoding
 
     ret = avcodec_open2(codec_ctx, codec, nullptr);
     if (ret < 0) {
@@ -177,75 +494,76 @@ int VideoRenderer::play(const VideoOptions& opts) {
         return 1;
     }
 
-    // Dimensions - get terminal size BEFORE any output
+    // Video aspect ratio
+    double aspect = static_cast<double>(codec_ctx->width) / codec_ctx->height;
+    if (video_stream->sample_aspect_ratio.num > 0 && video_stream->sample_aspect_ratio.den > 0) {
+        aspect *= av_q2d(video_stream->sample_aspect_ratio);
+    }
+
+    // Query terminal dimensions
     int term_w = 80, term_h = 24;
-    bool got_size = Terminal::get_size(term_w, term_h);
+    Terminal::get_size(term_w, term_h);
 
-    // Debug: If terminal size detection failed, try harder
-    if (!got_size || term_w < 40 || term_h < 10) {
-        // Fallback: assume reasonably large terminal
-        term_w = 120;
-        term_h = 30;
-    }
+    RenderMode current_mode = opts.mode;
+    int render_w = 0, render_h = 0;
+    int pad_x = 0, pad_y = 0;
 
-    int target_width = opts.width;
-    int target_height = opts.height;
-
-    // Fullscreen mode: use entire terminal BUT cap for performance
-    if (opts.fullscreen) {
-        // Cap fullscreen at 120 columns for smooth playback
-        // Terminal I/O is the bottleneck, not CPU
-        target_width = std::min(term_w, 120);
-        target_height = std::min(term_h - 1, 35);
-    } else {
-        if (target_width <= 0) target_width = std::min(term_w, 100);
-        if (target_height <= 0) {
-            float aspect = static_cast<float>(codec_ctx->height) / codec_ctx->width;
-            target_height = static_cast<int>(target_width * aspect * 0.5f);
-            target_height = std::min(target_height, term_h - 1);
-        }
-    }
-
-    target_width = std::max(10, target_width);
-    target_height = std::max(5, target_height);
-
-    // Scaling - use POINT (nearest neighbor) for speed in fullscreen mode
-    int sws_flags = (target_width > 100) ? SWS_POINT : SWS_BILINEAR;
-
-    sws_ctx = sws_getContext(
-        codec_ctx->width, codec_ctx->height, codec_ctx->pix_fmt,
-        target_width, target_height, AV_PIX_FMT_RGB24,
-        sws_flags, nullptr, nullptr, nullptr
-    );
-
-    if (!sws_ctx) {
-        std::cerr << "Error: Failed to create scaler\n";
-        avcodec_free_context(&codec_ctx);
-        avformat_close_input(&format_ctx);
-        return 1;
-    }
+    calculate_dimensions(current_mode, opts, aspect, term_w, term_h,
+                         render_w, render_h, pad_x, pad_y);
 
     frame = av_frame_alloc();
     rgb_frame = av_frame_alloc();
     packet = av_packet_alloc();
 
     if (!frame || !rgb_frame || !packet) {
-        std::cerr << "Error: Failed to allocate frames\n";
+        std::cerr << "Error: Failed to allocate FFmpeg frames\n";
         if (frame) av_frame_free(&frame);
         if (rgb_frame) av_frame_free(&rgb_frame);
         if (packet) av_packet_free(&packet);
-        sws_freeContext(sws_ctx);
         avcodec_free_context(&codec_ctx);
         avformat_close_input(&format_ctx);
         return 1;
     }
 
-    int buffer_size = av_image_get_buffer_size(AV_PIX_FMT_RGB24, target_width, target_height, 1);
-    rgb_buffer = static_cast<uint8_t*>(av_malloc(buffer_size));
-    av_image_fill_arrays(rgb_frame->data, rgb_frame->linesize, rgb_buffer,
-                        AV_PIX_FMT_RGB24, target_width, target_height, 1);
+    // Allocate rgb_frame with 32-byte SIMD alignment to guarantee zero heap corruption in sws_scale
+    int buffer_size = av_image_alloc(
+        rgb_frame->data, rgb_frame->linesize,
+        render_w, render_h, AV_PIX_FMT_RGB24, 32
+    );
 
-    // FPS
+    if (buffer_size < 0) {
+        std::cerr << "Error: Failed to allocate image buffer\n";
+        av_frame_free(&rgb_frame);
+        av_frame_free(&frame);
+        av_packet_free(&packet);
+        avcodec_free_context(&codec_ctx);
+        avformat_close_input(&format_ctx);
+        return 1;
+    }
+
+    // Scaling context (Bilinear for anti-aliasing)
+    sws_ctx = sws_getContext(
+        codec_ctx->width, codec_ctx->height, codec_ctx->pix_fmt,
+        render_w, render_h, AV_PIX_FMT_RGB24,
+        SWS_BILINEAR, nullptr, nullptr, nullptr
+    );
+
+    if (!sws_ctx) {
+        std::cerr << "Error: Failed to create software scaler\n";
+        av_freep(&rgb_frame->data[0]);
+        av_frame_free(&rgb_frame);
+        av_frame_free(&frame);
+        av_packet_free(&packet);
+        avcodec_free_context(&codec_ctx);
+        avformat_close_input(&format_ctx);
+        return 1;
+    }
+
+    if (opts.smoothing > 0.0f) {
+        prev_rgb_buffer = static_cast<uint8_t*>(av_mallocz(buffer_size));
+    }
+
+    // Framerate determination
     double source_fps = av_q2d(video_stream->avg_frame_rate);
     if (source_fps <= 0.0 || source_fps > 120.0) {
         source_fps = av_q2d(video_stream->r_frame_rate);
@@ -253,59 +571,43 @@ int VideoRenderer::play(const VideoOptions& opts) {
     if (source_fps <= 0.0 || source_fps > 120.0) {
         source_fps = 30.0;
     }
-
     double target_fps = opts.fps > 0 ? opts.fps : source_fps;
-
-    // Smart FPS adjustment based on resolution
-    // Terminal I/O is the bottleneck, not CPU power
-    if (opts.fps == 0) {  // Only auto-adjust if user didn't specify FPS
-        int pixel_count = target_width * target_height;
-        if (pixel_count > 3500) {
-            target_fps = 20;  // Large render: cap at 20 FPS
-        } else if (pixel_count > 2500) {
-            target_fps = 24;  // Medium render: 24 FPS
-        } else {
-            target_fps = std::min(30.0, target_fps);  // Small render: up to 30 FPS
-        }
-    }
-
     auto frame_duration = std::chrono::duration<double>(1.0 / target_fps);
+    double time_base = av_q2d(video_stream->time_base);
 
     const Charset* cs = get_charset(opts.charset);
     const std::string& ramp = cs->ramp;
 
-    // Audio - start immediately without delay to sync with video
+    // Audio setup
     std::thread audio_thread;
-    AudioPlayer audio_player(opts.path, opts.audio_delay, opts.no_audio);
+    AudioPlayer audio_player(video_path, opts.audio_delay, opts.no_audio);
 
-    // Terminal setup with double buffering
-    Terminal::setup_signal_handlers();
+    // Terminal display setup
     Terminal::hide_cursor();
-
-    // Enable synchronized output mode to prevent tearing (DEC private mode 2026)
-    std::cout << "\033[?2026h" << std::flush;
-
-    // Use alternate screen buffer for clean rendering
-    std::cout << "\033[?1049h" << std::flush;
-
+    Terminal::enable_alternate_buffer();
+    Terminal::set_synchronized_output(true);
     Terminal::clear();
-
-    // Disable line wrapping to prevent unwanted line breaks
+    // Disable autowrap so rightmost characters never scroll
     std::cout << "\033[?7l" << std::flush;
 
-    // Start audio AFTER terminal setup but BEFORE starting frame timer
     if (!opts.no_audio) {
         audio_thread = std::thread([&audio_player]() { audio_player.start(); });
-        // Give audio a tiny head start to account for audio buffer latency
         std::this_thread::sleep_for(std::chrono::milliseconds(50));
     }
 
     auto playback_start = std::chrono::steady_clock::now();
+    int64_t start_pts = AV_NOPTS_VALUE;
     int frame_index = 0;
     int consecutive_skipped = 0;
 
-    // Main decode loop
-    while (av_read_frame(format_ctx, packet) >= 0) {
+    // Pre-allocated frame buffer for zero memory allocation during playback
+    std::string frame_str;
+    frame_str.reserve(render_w * (render_h / 2) * 36 + 16384);
+
+    bool should_stop = false;
+
+    // Main decode and presentation loop
+    while (!should_stop && av_read_frame(format_ctx, packet) >= 0) {
         if (packet->stream_index == video_stream_idx) {
             ret = avcodec_send_packet(codec_ctx, packet);
             if (ret < 0) {
@@ -321,130 +623,318 @@ int VideoRenderer::play(const VideoOptions& opts) {
                     break;
                 }
 
-                // Scale
-                sws_scale(sws_ctx, frame->data, frame->linesize, 0, codec_ctx->height,
-                         rgb_frame->data, rgb_frame->linesize);
+                // Interactive keyboard check
+#ifdef _WIN32
+                if (_kbhit()) {
+                    int ch = _getch();
+                    if (ch == 'q' || ch == 'Q' || ch == 27) { // q or ESC
+                        should_stop = true;
+                        audio_player.stop();
+                        break;
+                    } else if (ch == ' ') { // pause
+                        audio_player.pause();
+                        auto pause_start = std::chrono::steady_clock::now();
+                        while (true) {
+                            std::this_thread::sleep_for(std::chrono::milliseconds(40));
+                            if (_kbhit()) {
+                                int rk = _getch();
+                                if (rk == 'q' || rk == 'Q' || rk == 27) {
+                                    should_stop = true;
+                                    audio_player.stop();
+                                    break;
+                                }
+                                break;
+                            }
+                        }
+                        auto pause_end = std::chrono::steady_clock::now();
+                        playback_start += (pause_end - pause_start);
+                        if (!should_stop) {
+                            audio_player.resume();
+                        }
+                    } else if (ch == 'm' || ch == 'M') { // cycle modes
+                        if (current_mode == RenderMode::Blocks) current_mode = RenderMode::Ascii;
+                        else if (current_mode == RenderMode::Ascii) current_mode = RenderMode::Solid;
+                        else current_mode = RenderMode::Blocks;
 
-                // Timing
-                auto target_time = playback_start + std::chrono::duration_cast<std::chrono::steady_clock::duration>(
-                    frame_index * frame_duration
-                );
+                        int new_w = 0, new_h = 0;
+                        Terminal::get_size(term_w, term_h);
+                        calculate_dimensions(current_mode, opts, aspect, term_w, term_h,
+                                             new_w, new_h, pad_x, pad_y);
+                        if (new_w != render_w || new_h != render_h) {
+                            render_w = new_w;
+                            render_h = new_h;
+                            sws_freeContext(sws_ctx);
+                            sws_ctx = sws_getContext(codec_ctx->width, codec_ctx->height, codec_ctx->pix_fmt,
+                                                     render_w, render_h, AV_PIX_FMT_RGB24,
+                                                     SWS_BILINEAR, nullptr, nullptr, nullptr);
+                            if (rgb_frame->data[0]) av_freep(&rgb_frame->data[0]);
+                            buffer_size = av_image_alloc(rgb_frame->data, rgb_frame->linesize,
+                                                         render_w, render_h, AV_PIX_FMT_RGB24, 32);
+                            if (opts.smoothing > 0.0f) {
+                                if (prev_rgb_buffer) av_free(prev_rgb_buffer);
+                                prev_rgb_buffer = static_cast<uint8_t*>(av_mallocz(buffer_size));
+                            }
+                            frame_str.reserve(render_w * (render_h / 2) * 36 + 16384);
+                            Terminal::clear();
+                        }
+                    } else if (ch == 'f' || ch == 'F') { // Fullscreen
+                        Terminal::maximize_window();
+                        int new_w = 0, new_h = 0;
+                        Terminal::get_size(term_w, term_h);
+                        VideoOptions fs_opts = opts;
+                        fs_opts.fullscreen = true;
+                        calculate_dimensions(current_mode, fs_opts, aspect, term_w, term_h,
+                                             new_w, new_h, pad_x, pad_y);
+                        if (new_w != render_w || new_h != render_h) {
+                            render_w = new_w;
+                            render_h = new_h;
+                            sws_freeContext(sws_ctx);
+                            sws_ctx = sws_getContext(codec_ctx->width, codec_ctx->height, codec_ctx->pix_fmt,
+                                                     render_w, render_h, AV_PIX_FMT_RGB24,
+                                                     SWS_BILINEAR, nullptr, nullptr, nullptr);
+                            if (rgb_frame->data[0]) av_freep(&rgb_frame->data[0]);
+                            buffer_size = av_image_alloc(rgb_frame->data, rgb_frame->linesize,
+                                                         render_w, render_h, AV_PIX_FMT_RGB24, 32);
+                            if (opts.smoothing > 0.0f) {
+                                if (prev_rgb_buffer) av_free(prev_rgb_buffer);
+                                prev_rgb_buffer = static_cast<uint8_t*>(av_mallocz(buffer_size));
+                            }
+                            frame_str.reserve(render_w * (render_h / 2) * 36 + 16384);
+                            Terminal::clear();
+                        }
+                    }
+                }
+#endif
+
+                // Periodic window resize check (only after playback is underway)
+                if (frame_index > 0 && frame_index % 30 == 0) {
+                    int cur_w = 0, cur_h = 0;
+                    if (Terminal::get_size(cur_w, cur_h) && (cur_w != term_w || cur_h != term_h)) {
+                        term_w = cur_w;
+                        term_h = cur_h;
+                        int new_w = 0, new_h = 0;
+                        calculate_dimensions(current_mode, opts, aspect, term_w, term_h,
+                                             new_w, new_h, pad_x, pad_y);
+                        if (new_w != render_w || new_h != render_h) {
+                            render_w = new_w;
+                            render_h = new_h;
+                            sws_freeContext(sws_ctx);
+                            sws_ctx = sws_getContext(codec_ctx->width, codec_ctx->height, codec_ctx->pix_fmt,
+                                                     render_w, render_h, AV_PIX_FMT_RGB24,
+                                                     SWS_BILINEAR, nullptr, nullptr, nullptr);
+                            if (rgb_frame->data[0]) av_freep(&rgb_frame->data[0]);
+                            buffer_size = av_image_alloc(rgb_frame->data, rgb_frame->linesize,
+                                                         render_w, render_h, AV_PIX_FMT_RGB24, 32);
+                            if (opts.smoothing > 0.0f) {
+                                if (prev_rgb_buffer) av_free(prev_rgb_buffer);
+                                prev_rgb_buffer = static_cast<uint8_t*>(av_mallocz(buffer_size));
+                            }
+                            frame_str.reserve(render_w * (render_h / 2) * 36 + 16384);
+                            Terminal::clear();
+                        }
+                    }
+                }
+
+                // PTS-based presentation timestamp calculation
+                double target_sec = 0.0;
+                int64_t best_pts = frame->best_effort_timestamp;
+                if (best_pts != AV_NOPTS_VALUE && best_pts >= 0) {
+                    if (start_pts == AV_NOPTS_VALUE) {
+                        start_pts = best_pts;
+                    }
+                    target_sec = (best_pts - start_pts) * time_base;
+                } else {
+                    target_sec = frame_index / target_fps;
+                }
+
+                auto target_time = playback_start + std::chrono::duration<double>(target_sec);
                 auto now = std::chrono::steady_clock::now();
 
+                // Dynamic frame drop if falling behind real time
                 if (now > target_time + frame_duration && consecutive_skipped < opts.max_frame_skip) {
                     consecutive_skipped++;
                     frame_index++;
                     continue;
                 }
-
                 consecutive_skipped = 0;
 
-                // Render
-                std::ostringstream oss;
+                // Scale decoded frame to target dimensions
+                sws_scale(sws_ctx, frame->data, frame->linesize, 0, codec_ctx->height,
+                          rgb_frame->data, rgb_frame->linesize);
 
-                // Use synchronized update begin/end markers to prevent tearing
-                oss << "\033[?2026h";  // Begin synchronized update
-                oss << "\033[H";        // Home cursor (top-left) - CRITICAL: prevents vertical drift
+                // Temporal smoothing if enabled
+                if (opts.smoothing > 0.0f && prev_rgb_buffer) {
+                    float alpha = std::clamp(opts.smoothing, 0.0f, 0.95f);
+                    float inv_alpha = 1.0f - alpha;
+                    uint8_t* cur_data = rgb_frame->data[0];
+                    for (int i = 0; i < buffer_size; ++i) {
+                        uint8_t cur = cur_data[i];
+                        uint8_t blended = static_cast<uint8_t>(cur * inv_alpha + prev_rgb_buffer[i] * alpha);
+                        cur_data[i] = blended;
+                        prev_rgb_buffer[i] = blended;
+                    }
+                }
+
+                // Construct frame buffer atomically
+                frame_str.clear();
+                // Synchronized update start
+                frame_str.append("\033[?2026h");
 
                 const uint8_t* data = rgb_frame->data[0];
+                int stride = rgb_frame->linesize[0];
 
-                if (opts.color) {
-                    // Ultra-optimized color rendering for fullscreen
-                    int prev_r = -1, prev_g = -1, prev_b = -1;
+                if (current_mode == RenderMode::Blocks) {
+                    // Ultra-smooth Half-Block 24-bit TrueColor rendering
+                    int num_lines = render_h / 2;
+                    int prev_fg_r = -1, prev_fg_g = -1, prev_fg_b = -1;
+                    int prev_bg_r = -1, prev_bg_g = -1, prev_bg_b = -1;
 
-                    for (int y = 0; y < target_height; y++) {
-                        const uint8_t* row_data = data + (y * target_width) * 3;
+                    for (int line = 0; line < num_lines; ++line) {
+                        // Position cursor directly at (row, col) - never use \n to prevent scrolling
+                        append_cursor_pos(frame_str, 1 + pad_y + line, 1 + pad_x);
 
-                        for (int x = 0; x < target_width; x++) {
+                        const uint8_t* top_row = data + (line * 2) * stride;
+                        const uint8_t* bot_row = data + (line * 2 + 1) * stride;
+
+                        for (int x = 0; x < render_w; ++x) {
                             int idx = x * 3;
-                            int r = row_data[idx];
-                            int g = row_data[idx + 1];
-                            int b = row_data[idx + 2];
+                            int r1 = top_row[idx];
+                            int g1 = top_row[idx + 1];
+                            int b1 = top_row[idx + 2];
+                            int r2 = bot_row[idx];
+                            int g2 = bot_row[idx + 1];
+                            int b2 = bot_row[idx + 2];
 
-                            // Quantization for speed
-                            if (opts.quant > 0) {
+                            if (opts.quant > 1) {
+                                r1 = (r1 / opts.quant) * opts.quant;
+                                g1 = (g1 / opts.quant) * opts.quant;
+                                b1 = (b1 / opts.quant) * opts.quant;
+                                r2 = (r2 / opts.quant) * opts.quant;
+                                g2 = (g2 / opts.quant) * opts.quant;
+                                b2 = (b2 / opts.quant) * opts.quant;
+                            }
+
+                            if (r1 == r2 && g1 == g2 && b1 == b2) {
+                                // Same color on both halves: space with background color
+                                if (r1 != prev_bg_r || g1 != prev_bg_g || b1 != prev_bg_b) {
+                                    append_bg(frame_str, r1, g1, b1);
+                                    prev_bg_r = r1; prev_bg_g = g1; prev_bg_b = b1;
+                                }
+                                frame_str.push_back(' ');
+                            } else {
+                                if (r1 != prev_fg_r || g1 != prev_fg_g || b1 != prev_fg_b) {
+                                    append_fg(frame_str, r1, g1, b1);
+                                    prev_fg_r = r1; prev_fg_g = g1; prev_fg_b = b1;
+                                }
+                                if (r2 != prev_bg_r || g2 != prev_bg_g || b2 != prev_bg_b) {
+                                    append_bg(frame_str, r2, g2, b2);
+                                    prev_bg_r = r2; prev_bg_g = g2; prev_bg_b = b2;
+                                }
+                                // Unicode upper half block ▀
+                                frame_str.append("\xE2\x96\x80");
+                            }
+                        }
+
+                        if (prev_bg_r != -1) {
+                            frame_str.append("\033[49m");
+                            prev_bg_r = -1;
+                        }
+                    }
+                } else if (current_mode == RenderMode::Solid) {
+                    // Full block █ rendering
+                    int prev_fg_r = -1, prev_fg_g = -1, prev_fg_b = -1;
+
+                    for (int line = 0; line < render_h; ++line) {
+                        append_cursor_pos(frame_str, 1 + pad_y + line, 1 + pad_x);
+
+                        const uint8_t* row = data + line * stride;
+                        for (int x = 0; x < render_w; ++x) {
+                            int idx = x * 3;
+                            int r = row[idx];
+                            int g = row[idx + 1];
+                            int b = row[idx + 2];
+
+                            if (opts.quant > 1) {
                                 r = (r / opts.quant) * opts.quant;
                                 g = (g / opts.quant) * opts.quant;
                                 b = (b / opts.quant) * opts.quant;
                             }
 
-                            // Faster color boost (simpler math)
-                            r = std::min(255, (r * 11) / 10);  // 10% brightness boost
-                            g = std::min(255, (g * 11) / 10);
-                            b = std::min(255, (b * 11) / 10);
-
-                            // Fast luminance
-                            int lum = (r + r + g + g + g + b) >> 3; // Approximation of 0.2126*r + 0.7152*g + 0.0722*b
-
-                            // Simplified character selection for speed
-                            char ch;
-                            if (lum < 26) {
-                                ch = ' ';
-                            } else if (lum < 77) {
-                                ch = '.';
-                            } else if (lum < 128) {
-                                ch = ':';
-                            } else if (lum < 179) {
-                                ch = '=';
-                            } else if (lum < 230) {
-                                ch = '#';
-                            } else {
-                                ch = '@';
+                            if (r != prev_fg_r || g != prev_fg_g || b != prev_fg_b) {
+                                append_fg(frame_str, r, g, b);
+                                prev_fg_r = r; prev_fg_g = g; prev_fg_b = b;
                             }
-
-                            // Only emit color change
-                            if (r != prev_r || g != prev_g || b != prev_b) {
-                                oss << "\033[38;2;" << r << ";" << g << ";" << b << "m";
-                                prev_r = r; prev_g = g; prev_b = b;
-                            }
-
-                            oss << ch;
+                            frame_str.append("\xE2\x96\x88");
                         }
-                        oss << "\033[0m\n";
-                        prev_r = prev_g = prev_b = -1;
                     }
                 } else {
-                    // Grayscale
-                    for (int y = 0; y < target_height; y++) {
-                        for (int x = 0; x < target_width; x++) {
-                            int idx = (y * target_width + x) * 3;
-                            float r = data[idx] / 255.0f;
-                            float g = data[idx + 1] / 255.0f;
-                            float b = data[idx + 2] / 255.0f;
-                            float lum = 0.2126f * r + 0.7152f * g + 0.0722f * b;
-                            oss << brightness_to_char(lum, ramp, opts.invert);
+                    // Ascii glyph rendering (color or grayscale)
+                    int prev_fg_r = -1, prev_fg_g = -1, prev_fg_b = -1;
+
+                    for (int line = 0; line < render_h; ++line) {
+                        append_cursor_pos(frame_str, 1 + pad_y + line, 1 + pad_x);
+
+                        const uint8_t* row = data + line * stride;
+                        for (int x = 0; x < render_w; ++x) {
+                            int idx = x * 3;
+                            int r = row[idx];
+                            int g = row[idx + 1];
+                            int b = row[idx + 2];
+
+                            if (opts.quant > 1) {
+                                r = (r / opts.quant) * opts.quant;
+                                g = (g / opts.quant) * opts.quant;
+                                b = (b / opts.quant) * opts.quant;
+                            }
+
+                            int lum = (r * 54 + g * 183 + b * 19) >> 8;
+                            char ch = brightness_to_char(lum / 255.0f, ramp, opts.invert);
+
+                            if (opts.color) {
+                                if (r != prev_fg_r || g != prev_fg_g || b != prev_fg_b) {
+                                    append_fg(frame_str, r, g, b);
+                                    prev_fg_r = r; prev_fg_g = g; prev_fg_b = b;
+                                }
+                            }
+                            frame_str.push_back(ch);
                         }
-                        oss << '\n';
                     }
                 }
 
-                // End synchronized update - this ensures the entire frame is drawn atomically
-                oss << "\033[?2026l";
+                // Reset color and end synchronized update
+                frame_str.append("\033[0m\033[?2026l");
 
-                // Write entire frame in ONE syscall for perfectly smooth rendering
-                std::string frame_str = oss.str();
-                std::fwrite(frame_str.data(), 1, frame_str.size(), stdout);
-                std::fflush(stdout);
+                // Single atomic write to console device
+                Terminal::write_raw(frame_str.data(), frame_str.size());
 
                 frame_index++;
 
-                // Sleep
+                // Ultra-smooth hybrid sleep (coarse sleep + fine spin-wait yield)
                 now = std::chrono::steady_clock::now();
                 if (now < target_time) {
-                    std::this_thread::sleep_for(target_time - now);
+                    auto sleep_dur = target_time - now;
+                    if (sleep_dur > std::chrono::milliseconds(3)) {
+                        std::this_thread::sleep_for(sleep_dur - std::chrono::milliseconds(2));
+                    }
+                    while (std::chrono::steady_clock::now() < target_time) {
+                        std::this_thread::yield();
+                    }
                 }
             }
         }
         av_packet_unref(packet);
     }
 
-    // Cleanup
+    // Cleanup resources
     audio_player.stop();
     if (audio_thread.joinable()) {
         audio_thread.join();
     }
 
-    if (rgb_buffer) av_free(rgb_buffer);
+    if (rgb_frame && rgb_frame->data[0]) {
+        av_freep(&rgb_frame->data[0]);
+    }
+    if (prev_rgb_buffer) av_free(prev_rgb_buffer);
     av_frame_free(&rgb_frame);
     av_frame_free(&frame);
     av_packet_free(&packet);
@@ -452,12 +942,8 @@ int VideoRenderer::play(const VideoOptions& opts) {
     avcodec_free_context(&codec_ctx);
     avformat_close_input(&format_ctx);
 
-    // Restore terminal state
-    std::cout << "\033[?2026l";  // Disable synchronized output
-    std::cout << "\033[?7h";     // Re-enable line wrapping
-    std::cout << "\033[?1049l";  // Exit alternate screen
-    Terminal::show_cursor();
-    std::cout << "\033[0m" << std::endl;
+    // Restore terminal configuration
+    Terminal::restore();
 
     return 0;
 }

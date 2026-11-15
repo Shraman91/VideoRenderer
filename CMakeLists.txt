@@ -56,7 +56,7 @@ endif()
 
 # Platform-specific libraries
 if(WIN32)
-    target_link_libraries(ascii-art)
+    target_link_libraries(ascii-art winmm)
 else()
     target_link_libraries(ascii-art m pthread)
 endif()
